@@ -9,7 +9,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "deploy": "firebase deploy --only hosting,functions",
+    "deploy": "firebase deploy --only hosting,database",
+    "deploy:full": "firebase deploy --only hosting,functions,database",
     "deploy:hosting": "firebase deploy --only hosting",
     "deploy:rules": "firebase deploy --only database:rules"
   },
@@ -26,7 +27,8 @@
     "cors": "^2.8.5",
     "express": "^4.18.0",
     "express-rate-limit": "^8.3.2",
-    "firebase-admin": "^13.8.0"
+    "firebase-admin": "^13.8.0",
+    "firebase-functions": "^7.2.5"
   },
   "devDependencies": {
     "firebase-tools": "^13.0.0"

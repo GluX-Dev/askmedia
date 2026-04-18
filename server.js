@@ -46,33 +46,89 @@ loadEnvFile(path.join(__dirname, ".env"));
 
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || "https://ask-media-cc963-default-rtdb.europe-west1.firebasedatabase.app";
 
-// Initialize Firebase Admin SDK with service account
-try {
-  const serviceAccountPath = path.join(__dirname, "serviceAccountKey.json");
-  let serviceAccount;
+// ============================================================================
+// FIREBASE ADMIN SDK INITIALIZATION
+// Credential priority:
+//   1. Individual env vars  (FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY) â† preferred
+//   2. GOOGLE_APPLICATION_CREDENTIALS path (file on disk)
+//   3. serviceAccountKey.json in project root (legacy fallback)
+// ============================================================================
 
-  try {
-    serviceAccount = require(serviceAccountPath);
-    console.log("✓ Service account loaded from serviceAccountKey.json");
-  } catch (e) {
-    console.warn("⚠ serviceAccountKey.json not found, trying GOOGLE_APPLICATION_CREDENTIALS...");
-    if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-      console.log("✓ Service account loaded from GOOGLE_APPLICATION_CREDENTIALS");
-    } else {
-      throw new Error("No service account found");
-    }
+function buildServiceAccountFromEnv() {
+  const clientEmail  = (process.env.FIREBASE_CLIENT_EMAIL  || "").trim();
+  const privateKeyRaw = (process.env.FIREBASE_PRIVATE_KEY   || "").trim();
+  const projectId    = (process.env.FIREBASE_PROJECT_ID    || process.env.GCLOUD_PROJECT || "").trim();
+
+  if (!clientEmail || !privateKeyRaw || !projectId) {
+    return null; // env vars not set â€” try next strategy
   }
 
+  // .env files often escape newlines as \n literals â€” restore actual newlines
+  const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+
+  return {
+    type: "service_account",
+    project_id: projectId,
+    private_key_id: (process.env.FIREBASE_PRIVATE_KEY_ID || "").trim() || undefined,
+    private_key:    privateKey,
+    client_email:   clientEmail,
+    client_id:      (process.env.FIREBASE_CLIENT_ID      || "").trim() || undefined,
+    auth_uri:       "https://accounts.google.com/o/oauth2/auth",
+    token_uri:      "https://oauth2.googleapis.com/token",
+  };
+}
+
+const isFirebaseRuntime = Boolean(
+  process.env.FUNCTION_TARGET ||
+  process.env.FUNCTION_NAME ||
+  process.env.K_SERVICE ||
+  process.env.FIREBASE_CONFIG
+);
+
+try {
   if (!admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      databaseURL: DATABASE_URL
-    });
-    console.log("✓ Firebase Admin SDK initialized");
+    let credential;
+
+    // Strategy 1: individual env vars for local/server deployments.
+    const envAccount = buildServiceAccountFromEnv();
+    if (envAccount) {
+      credential = admin.credential.cert(envAccount);
+      console.log("Firebase: credential loaded from environment variables");
+
+    // Strategy 2: explicit JSON key file path.
+    } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS.trim();
+      const credJson = require(credPath);
+      credential = admin.credential.cert(credJson);
+      console.log(
+        `Firebase: credential loaded from GOOGLE_APPLICATION_CREDENTIALS (${credPath})`
+      );
+
+    // Strategy 3: Firebase runtime default service account.
+    } else if (isFirebaseRuntime) {
+      credential = admin.credential.applicationDefault();
+      console.log("Firebase: using application default credentials");
+
+    // Strategy 4: legacy serviceAccountKey.json file in project root.
+    } else {
+      const keyPath = path.join(__dirname, "serviceAccountKey.json");
+      if (!fs.existsSync(keyPath)) {
+        throw new Error(
+          "No Firebase credentials found. " +
+          "Set FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY + FIREBASE_PROJECT_ID in .env, " +
+          "set GOOGLE_APPLICATION_CREDENTIALS to a key-file path, or run inside Firebase runtime."
+        );
+      }
+      const keyJson = JSON.parse(fs.readFileSync(keyPath, "utf8"));
+      credential = admin.credential.cert(keyJson);
+      console.log("Firebase: credential loaded from serviceAccountKey.json");
+    }
+
+    admin.initializeApp({ credential, databaseURL: DATABASE_URL });
+    console.log("Firebase Admin SDK initialized");
   }
 } catch (err) {
-  console.error("❌ Firebase initialization failed:", err.message);
+  console.error("Firebase initialization failed:", err.message);
   process.exit(1);
 }
 
@@ -230,7 +286,7 @@ const allowedOrigins = new Set([
 ].filter(Boolean));
 
 if (HUBNET_WEBHOOK_SECRET && !hasHubnetWebhookSecret) {
-  console.warn("⚠ HUBNET_WEBHOOK_SECRET should be a long random string, not a URL. Update it to keep Hubnet webhooks secure.");
+  console.warn("âš  HUBNET_WEBHOOK_SECRET should be a long random string, not a URL. Update it to keep Hubnet webhooks secure.");
 }
 
 // Optional: Load Paystack helper if configured
@@ -240,10 +296,10 @@ try {
   PaystackHelper = require("./svc-integrations.js").PaystackHelper;
   if (hasPaystackSecretKey) {
     paystack = new PaystackHelper(PAYSTACK_SECRET_KEY, hasPaystackPublicKey ? PAYSTACK_PUBLIC_KEY : "");
-    console.log("✓ Paystack configured");
+    console.log("âœ“ Paystack configured");
   }
 } catch (e) {
-  console.warn("⚠ Paystack helper not available");
+  console.warn("âš  Paystack helper not available");
 }
 
 // Optional: Load Hubnet helper if configured
@@ -253,10 +309,10 @@ try {
   HubnetHelper = require("./svc-integrations.js").HubnetHelper;
   if (hasHubnetApiKey) {
     hubnet = new HubnetHelper(HUBNET_API_KEY, HUBNET_API_BASE_URL);
-    console.log("✓ Hubnet configured");
+    console.log("âœ“ Hubnet configured");
   }
 } catch (e) {
-  console.warn("⚠ Hubnet helper not available");
+  console.warn("âš  Hubnet helper not available");
 }
 
 // Optional: Load Fulfillment helper if configured
@@ -266,13 +322,13 @@ try {
   FulfillmentHelper = require("./svc-integrations.js").FulfillmentHelper;
   if (hasFulfillmentBaseUrl && hasFulfillmentApiKey) {
     fulfillment = new FulfillmentHelper(FULFILLMENT_API_BASE_URL, FULFILLMENT_API_KEY);
-    console.log("✓ Fulfillment configured");
+    console.log("âœ“ Fulfillment configured");
   }
 } catch (e) {
-  console.warn("⚠ Fulfillment helper not available");
+  console.warn("âš  Fulfillment helper not available");
 }
 
-console.log("âœ“ Payment and Hubnet audit logging enabled");
+console.log("Ã¢Å“â€œ Payment and Hubnet audit logging enabled");
 
 function getRequestOrigin(req) {
   const origin = sanitizeString(req.get("origin"), 200);
@@ -548,7 +604,7 @@ function extractHubnetResponseDetails(response, fallbackReference) {
   const preview = response && typeof response === "object"
     ? JSON.stringify(response).substring(0, 350)
     : String(response);
-  console.log(`  [Hubnet] parse response | preview: ${preview}${preview.length >= 350 ? "…" : ""}`);
+  console.log(`  [Hubnet] parse response | preview: ${preview}${preview.length >= 350 ? "â€¦" : ""}`);
   
   const data = response && typeof response.data === "object" ? response.data : {};
   const status = response?.status ?? data?.status ?? null;
@@ -607,7 +663,7 @@ function extractHubnetResponseDetails(response, fallbackReference) {
     || Boolean(paymentId)
     || /success|accepted|processing|queued|initiated/i.test(`${message || ""} ${reason || ""}`);
 
-  console.log(`  [Hubnet] extracted | status=${status} accepted=${accepted} tx=${transactionId || "—"} pay=${paymentId || "—"} msgCode=${message || "—"} reason=${reason || "—"}`);
+  console.log(`  [Hubnet] extracted | status=${status} accepted=${accepted} tx=${transactionId || "â€”"} pay=${paymentId || "â€”"} msgCode=${message || "â€”"} reason=${reason || "â€”"}`);
 
   return {
     status,
@@ -1063,7 +1119,7 @@ function normalizeHubnetTransactionId(value) {
 }
 
 function makeHubnetReference(paystackReference) {
-  // Hubnet reference must be 6–25 alphanumeric/hyphen chars.
+  // Hubnet reference must be 6â€“25 alphanumeric/hyphen chars.
   // Hash the Paystack reference to ensure uniqueness across server restarts.
   const hash = crypto
     .createHash("sha256")
@@ -1107,7 +1163,7 @@ function mapHubnetWebhookToFulfillmentStatus(eventName, payload) {
 
   const reason = sanitizeString(payload?.reason || payload?.data?.reason || "", 200).toLowerCase();
 
-  // ── Priority 1: Hubnet event name (most authoritative) ───────────────────────
+  // â”€â”€ Priority 1: Hubnet event name (most authoritative) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Known Hubnet delivery events from their docs:
   if (event === "transfer.delivered" || event === "bundle.delivered" || event === "transaction.delivered") {
     return "delivered";
@@ -1119,7 +1175,7 @@ function mapHubnetWebhookToFulfillmentStatus(eventName, payload) {
     return "processing";
   }
 
-  // ── Priority 2: data.status field (Hubnet real-time status string) ────────────
+  // â”€â”€ Priority 2: data.status field (Hubnet real-time status string) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (dataStatus) {
     if (/^(delivered|fulfilled|successful|success|completed)$/i.test(dataStatus)) {
       return "delivered";
@@ -1132,7 +1188,7 @@ function mapHubnetWebhookToFulfillmentStatus(eventName, payload) {
     }
   }
 
-  // ── Priority 3: Fall back to combined text analysis ───────────────────────────
+  // â”€â”€ Priority 3: Fall back to combined text analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const combined = `${event} ${dataStatus} ${message} ${reason}`;
   if (/(delivered|fulfilled|transfer successful|bundle.*success)/.test(combined)) {
     return "delivered";
@@ -1144,74 +1200,74 @@ function mapHubnetWebhookToFulfillmentStatus(eventName, payload) {
     return "processing";
   }
 
-  // Default: treat as in-progress — Hubnet will send another webhook when done.
+  // Default: treat as in-progress â€” Hubnet will send another webhook when done.
   return "processing";
 }
 
 async function attemptHubnetFulfillment(orderId) {
-  console.log(`\n→→→ [HUBNET INTERNAL] attemptHubnetFulfillment() called for order: ${orderId}`);
+  console.log(`\nâ†’â†’â†’ [HUBNET INTERNAL] attemptHubnetFulfillment() called for order: ${orderId}`);
   
   if (!hubnet) {
-    console.error(`✗ [HUBNET EARLY EXIT] Hubnet not configured (HUBNET_API_KEY missing or invalid)`);
+    console.error(`âœ— [HUBNET EARLY EXIT] Hubnet not configured (HUBNET_API_KEY missing or invalid)`);
     return { attempted: false, reason: "hubnet_not_configured" };
   }
-  console.log(`  ✓ Hubnet helper loaded`);
+  console.log(`  âœ“ Hubnet helper loaded`);
 
   const orderRef = db.ref(`orders/${orderId}`);
   const sessionRef = db.ref(`paymentSessions/${orderId}`);
 
-  console.log(`  → Reading order from Firebase...`);
+  console.log(`  â†’ Reading order from Firebase...`);
   const orderSnapshot = await orderRef.once("value");
   if (!orderSnapshot.exists()) {
-    console.error(`✗ [HUBNET EARLY EXIT] Order not found in database: ${orderId}`);
+    console.error(`âœ— [HUBNET EARLY EXIT] Order not found in database: ${orderId}`);
     return { attempted: false, reason: "order_not_found" };
   }
-  console.log(`  ✓ Order found in database`);
+  console.log(`  âœ“ Order found in database`);
 
   const order = orderSnapshot.val();
   const paymentStatus = sanitizeString(order.paymentStatus, 40).toLowerCase();
   const fulfillmentStatus = sanitizeString(order.fulfillmentStatus, 40).toLowerCase();
   
-  console.log(`  → Order status: paymentStatus="${paymentStatus}" | fulfillmentStatus="${fulfillmentStatus}"`);
+  console.log(`  â†’ Order status: paymentStatus="${paymentStatus}" | fulfillmentStatus="${fulfillmentStatus}"`);
 
   if (paymentStatus !== "paid") {
-    console.error(`✗ [HUBNET EARLY EXIT] Payment not confirmed. Status: "${paymentStatus}" (expected "paid")`);
+    console.error(`âœ— [HUBNET EARLY EXIT] Payment not confirmed. Status: "${paymentStatus}" (expected "paid")`);
     return { attempted: false, reason: "payment_not_confirmed" };
   }
-  console.log(`  ✓ Payment confirmed`);
+  console.log(`  âœ“ Payment confirmed`);
 
   if (!order.packageNetwork || !order.packageVolume) {
-    console.error(`✗ [HUBNET EARLY EXIT] Missing package details. Network: "${order.packageNetwork}" | Volume: "${order.packageVolume}"`);
+    console.error(`âœ— [HUBNET EARLY EXIT] Missing package details. Network: "${order.packageNetwork}" | Volume: "${order.packageVolume}"`);
     return { attempted: false, reason: "missing_package_network_volume" };
   }
-  console.log(`  ✓ Package details present: ${order.packageNetwork} / ${order.packageVolume}MB`);
+  console.log(`  âœ“ Package details present: ${order.packageNetwork} / ${order.packageVolume}MB`);
 
   if (["delivered", "fulfilled"].includes(fulfillmentStatus)) {
-    console.warn(`⚠ [HUBNET EARLY EXIT] Bundle already delivered/fulfilled. Status: "${fulfillmentStatus}"`);
+    console.warn(`âš  [HUBNET EARLY EXIT] Bundle already delivered/fulfilled. Status: "${fulfillmentStatus}"`);
     return { attempted: false, reason: "already_delivered" };
   }
 
   const priorTx = normalizeHubnetTransactionId(order.hubnetTransactionId);
   if (priorTx) {
-    // Already has a transaction ID — only skip if not failed.
+    // Already has a transaction ID â€” only skip if not failed.
     if (fulfillmentStatus !== "failed") {
-      console.warn(`⚠ [HUBNET EARLY EXIT] Already initiated. TxID: "${priorTx}" | Status: "${fulfillmentStatus}"`);
+      console.warn(`âš  [HUBNET EARLY EXIT] Already initiated. TxID: "${priorTx}" | Status: "${fulfillmentStatus}"`);
       return { attempted: false, reason: "already_initiated" };
     }
-    console.log(`  → Retrying after previous failure (TxID exists but status is "failed")`);
+    console.log(`  â†’ Retrying after previous failure (TxID exists but status is "failed")`);
   }
 
   const now = getCurrentTimestamp();
   // Enforce Hubnet's 25-char max reference constraint.
   const hubnetReference = sanitizeString(order.hubnetReference, 25) || makeHubnetReference(orderId);
 
-  console.log(`  → Acquiring Firebase transaction lock...`);
+  console.log(`  â†’ Acquiring Firebase transaction lock...`);
   const lock = await orderRef.transaction((current) => {
     // IMPORTANT: returning undefined aborts the transaction (committed=false).
-    // Rare races can pass current=null even right after we read the order — seed from the snapshot.
+    // Rare races can pass current=null even right after we read the order â€” seed from the snapshot.
     const base = current && typeof current === "object" ? current : null;
     if (!base) {
-      console.warn(`  ⚠ [HUBNET LOCK] Server state was null in transaction — applying lock from last order snapshot`);
+      console.warn(`  âš  [HUBNET LOCK] Server state was null in transaction â€” applying lock from last order snapshot`);
       return {
         ...order,
         fulfillmentProvider: "hubnet",
@@ -1272,22 +1328,22 @@ async function attemptHubnetFulfillment(orderId) {
     const inflight = Boolean(initAt) && !isStaleTimestamp(initAt);
     const fs = sanitizeString(o.fulfillmentStatus, 40).toLowerCase();
     if (txId) {
-      console.warn(`⚠ [HUBNET] Lock skipped — bundle request already created (tx: ${txId})`);
+      console.warn(`âš  [HUBNET] Lock skipped â€” bundle request already created (tx: ${txId})`);
       return { attempted: false, reason: "already_initiated" };
     }
     if (inflight && fs === "processing") {
-      console.warn("⚠ [HUBNET] Lock skipped — provisioning already in progress for this order.");
+      console.warn("âš  [HUBNET] Lock skipped â€” provisioning already in progress for this order.");
       return { attempted: false, reason: "hubnet_inflight" };
     }
-    console.error(`✗ [HUBNET EARLY EXIT] Transaction not committed. refreshedExists=${refreshed.exists()} fulfillment=${fs} snapshotFulfillment=${snapVal ? sanitizeString(snapVal.fulfillmentStatus, 40) : "n/a"}`);
+    console.error(`âœ— [HUBNET EARLY EXIT] Transaction not committed. refreshedExists=${refreshed.exists()} fulfillment=${fs} snapshotFulfillment=${snapVal ? sanitizeString(snapVal.fulfillmentStatus, 40) : "n/a"}`);
     return { attempted: false, reason: "locked" };
   }
-  console.log(`  ✓ Transaction lock acquired, order status set to "processing"`);
+  console.log(`  âœ“ Transaction lock acquired, order status set to "processing"`);
 
-  console.log(`  → Normalizing Ghana phone number...`);
+  console.log(`  â†’ Normalizing Ghana phone number...`);
   const msisdn = toGhanaNationalPhone(order.beneficiaryPhone);
   if (!msisdn) {
-    console.error(`✗ [HUBNET ERROR] Invalid Ghana phone number: "${order.beneficiaryPhone}"`);
+    console.error(`âœ— [HUBNET ERROR] Invalid Ghana phone number: "${order.beneficiaryPhone}"`);
     await Promise.all([
       orderRef.update({ fulfillmentStatus: "failed", status: "failed", fulfillmentError: "Invalid Ghana phone number.", updatedAt: getCurrentTimestamp() }),
       sessionRef.update({ fulfillmentStatus: "failed", fulfillmentError: "Invalid Ghana phone number.", updatedAt: getCurrentTimestamp() }),
@@ -1301,7 +1357,7 @@ async function attemptHubnetFulfillment(orderId) {
     }, "error");
     return { attempted: true, reason: "invalid_phone" };
   }
-  console.log(`  ✓ Phone normalized: ${msisdn}`);
+  console.log(`  âœ“ Phone normalized: ${msisdn}`);
 
   const webhookUrl = buildHubnetWebhookUrl();
   const referrer = /^\d{10}$/.test(String(HUBNET_REFERRER || ""))
@@ -1323,7 +1379,7 @@ async function attemptHubnetFulfillment(orderId) {
       webhook: webhookUrl,
     };
     
-    console.log(`  → Logging fulfillment request to audit trail...`);
+    console.log(`  â†’ Logging fulfillment request to audit trail...`);
     await auditLog("hubnet", "fulfillment-requested", {
       orderId,
       ownerId: order.ownerId,
@@ -1335,30 +1391,30 @@ async function attemptHubnetFulfillment(orderId) {
       webhook: webhookUrl,
     });
 
-    console.log(`\n→ [HUBNET REQUEST] Creating ${hubnetNetwork.toUpperCase()} bundle`);
-    console.log(`  └─ Reference: ${hubnetReference}`);
-    console.log(`  └─ Phone: ${msisdn}`);
-    console.log(`  └─ Volume: ${order.packageVolume}MB`);
-    console.log(`  └─ Webhook URL: ${webhookUrl}`);
-    console.log(`  → Sending to Hubnet API...`);
+    console.log(`\nâ†’ [HUBNET REQUEST] Creating ${hubnetNetwork.toUpperCase()} bundle`);
+    console.log(`  â””â”€ Reference: ${hubnetReference}`);
+    console.log(`  â””â”€ Phone: ${msisdn}`);
+    console.log(`  â””â”€ Volume: ${order.packageVolume}MB`);
+    console.log(`  â””â”€ Webhook URL: ${webhookUrl}`);
+    console.log(`  â†’ Sending to Hubnet API...`);
 
     let response;
     try {
-      console.log(`  → [HUBNET API CALL] network="${hubnetNetwork}" phone="${msisdn}" volume="${order.packageVolume}"MB reference="${hubnetReference}"`);
+      console.log(`  â†’ [HUBNET API CALL] network="${hubnetNetwork}" phone="${msisdn}" volume="${order.packageVolume}"MB reference="${hubnetReference}"`);
       response = await hubnet.createTransaction({ network: hubnetNetwork, ...requestPayload });
-      console.log(`  ✓ [HUBNET API RESPONSE] Received response object`);
+      console.log(`  âœ“ [HUBNET API RESPONSE] Received response object`);
     } catch (error) {
-      console.error(`  ✗ [HUBNET API ERROR] Error from Hubnet API:`);
-      console.error(`    └─ Error message: ${error?.message}`);
-      console.error(`    └─ Error payload: ${JSON.stringify(error?.payload, null, 2)}`);
-      console.error(`    └─ Error statusCode: ${error?.statusCode}`);
+      console.error(`  âœ— [HUBNET API ERROR] Error from Hubnet API:`);
+      console.error(`    â””â”€ Error message: ${error?.message}`);
+      console.error(`    â””â”€ Error payload: ${JSON.stringify(error?.payload, null, 2)}`);
+      console.error(`    â””â”€ Error statusCode: ${error?.statusCode}`);
       
       const msg = sanitizeString(error?.message, 300).toLowerCase();
       const msg2 = sanitizeString(error?.payload?.message, 200).toLowerCase();
       const invalidNetwork = msg.includes("invalid network") || msg2.includes("invalid network");
 
       if (networkCandidates.length > 1 && invalidNetwork) {
-        console.log(`  → Network "${hubnetNetwork}" invalid, retrying with fallback: "${networkCandidates[1]}"`);
+        console.log(`  â†’ Network "${hubnetNetwork}" invalid, retrying with fallback: "${networkCandidates[1]}"`);
         hubnetNetwork = networkCandidates[1];
         response = await hubnet.createTransaction({ network: hubnetNetwork, ...requestPayload });
       } else {
@@ -1366,16 +1422,16 @@ async function attemptHubnetFulfillment(orderId) {
       }
     }
 
-    console.log(`  → Checking Hubnet response acceptance...`);
+    console.log(`  â†’ Checking Hubnet response acceptance...`);
     const details = extractHubnetResponseDetails(response, hubnetReference);
-    console.log(`  → Response details: accepted="${details.accepted}" transactionId="${details.transactionId}" status="${details.status}"`);
+    console.log(`  â†’ Response details: accepted="${details.accepted}" transactionId="${details.transactionId}" status="${details.status}"`);
     
     if (!details.accepted) {
       const reason = details.message || details.reason || "Hubnet did not confirm the bundle request.";
-      console.error(`  ✗ Response marked as NOT ACCEPTED: ${reason}`);
+      console.error(`  âœ— Response marked as NOT ACCEPTED: ${reason}`);
       throw new Error(reason);
     }
-    console.log(`  ✓ Response marked as ACCEPTED by Hubnet`);
+    console.log(`  âœ“ Response marked as ACCEPTED by Hubnet`);
 
     const hubnetTransactionId = details.transactionId;
     const hubnetPaymentId = details.paymentId;
@@ -1388,7 +1444,7 @@ async function attemptHubnetFulfillment(orderId) {
       120
     );
 
-    console.log(`  → Updating order in Firebase with Hubnet response...`);
+    console.log(`  â†’ Updating order in Firebase with Hubnet response...`);
     await Promise.all([
       db.ref(`hubnetReferences/${hubnetReference}`).set({
         orderId,
@@ -1418,9 +1474,9 @@ async function attemptHubnetFulfillment(orderId) {
         updatedAt: getCurrentTimestamp(),
       }),
     ]);
-    console.log(`  ✓ Firebase updated with Hubnet response`);
+    console.log(`  âœ“ Firebase updated with Hubnet response`);
     
-    console.log(`  → Logging success to audit trail...`);
+    console.log(`  â†’ Logging success to audit trail...`);
     await auditLog("hubnet", "fulfillment-accepted", {
       orderId,
       ownerId: order.ownerId,
@@ -1432,24 +1488,24 @@ async function attemptHubnetFulfillment(orderId) {
       code: hubnetCode,
       message: hubnetMessage,
     });
-    console.log(`  ✓ Audit log recorded`);
+    console.log(`  âœ“ Audit log recorded`);
 
-    console.log("✓ [HUBNET SUCCESS] Bundle provision accepted");
-    console.log(`  └─ Transaction ID: ${hubnetTransactionId}`);
-    console.log(`  └─ Payment ID: ${hubnetPaymentId || "N/A"}`);
-    console.log(`  └─ Network: ${hubnetNetwork.toUpperCase()}`);
-    console.log(`  └─ Status Code: ${hubnetCode || "OK"}`);
-    console.log(`  └─ Message: ${hubnetMessage || "Bundle provisioning initiated"}`);
-    console.log(`  └─ Waiting for webhook confirmation...`);
+    console.log("âœ“ [HUBNET SUCCESS] Bundle provision accepted");
+    console.log(`  â””â”€ Transaction ID: ${hubnetTransactionId}`);
+    console.log(`  â””â”€ Payment ID: ${hubnetPaymentId || "N/A"}`);
+    console.log(`  â””â”€ Network: ${hubnetNetwork.toUpperCase()}`);
+    console.log(`  â””â”€ Status Code: ${hubnetCode || "OK"}`);
+    console.log(`  â””â”€ Message: ${hubnetMessage || "Bundle provisioning initiated"}`);
+    console.log(`  â””â”€ Waiting for webhook confirmation...`);
 
     return { attempted: true, hubnetReference, hubnetTransactionId };
   } catch (error) {
     const message = sanitizeString(error?.message || error?.payload?.message, 500) || "Hubnet transaction failed.";
     const now2 = getCurrentTimestamp();
     
-    console.error("\n╔════════════════════════════════════════════════════════════════╗");
-    console.error("║ ✗ [HUBNET ERROR] Bundle provision FAILED                      ║");
-    console.error("╚════════════════════════════════════════════════════════════════╝");
+    console.error("\nâ•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+    console.error("â•‘ âœ— [HUBNET ERROR] Bundle provision FAILED                      â•‘");
+    console.error("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
     console.error(`Error: ${message}`);
     console.error(`Order ID: ${orderId}`);
     console.error(`Reference: ${hubnetReference}`);
@@ -1466,11 +1522,11 @@ async function attemptHubnetFulfillment(orderId) {
     
     // Mark as 'failed' but keep status as 'paid' so the payment is not lost.
     // The order can be retried by calling attemptHubnetFulfillment again.
-    console.log(`  → Updating order status to "failed" in Firebase...`);
+    console.log(`  â†’ Updating order status to "failed" in Firebase...`);
     await Promise.all([
       orderRef.update({
         fulfillmentStatus: "failed",
-        // Keep overall status as 'paid' — the customer paid successfully.
+        // Keep overall status as 'paid' â€” the customer paid successfully.
         // Only fulfillment failed, not the payment.
         status: "paid",
         fulfillmentError: message,
@@ -1487,9 +1543,9 @@ async function attemptHubnetFulfillment(orderId) {
         updatedAt: now2,
       }),
     ]);
-    console.log(`  ✓ Order and session updated to failed status`);
+    console.log(`  âœ“ Order and session updated to failed status`);
     
-    console.log(`  → Logging failure to audit trail...`);
+    console.log(`  â†’ Logging failure to audit trail...`);
     await auditLog("hubnet", "fulfillment-failed", {
       orderId,
       ownerId: order.ownerId,
@@ -1498,7 +1554,7 @@ async function attemptHubnetFulfillment(orderId) {
       network: hubnetNetwork,
       error: message,
     }, "error");
-    console.log(`  ✓ Audit log recorded`);
+    console.log(`  âœ“ Audit log recorded`);
 
     return { attempted: true, reason: "hubnet_failed", error: message };
   }
@@ -1552,10 +1608,10 @@ async function legacyProcessSuccessfulPayment(reference, verifiedData, eventName
     throw httpError(400, "Amount mismatch detected.");
   }
 
-  // ─── IDEMPOTENCY ─────────────────────────────────────────────────────────────
+  // â”€â”€â”€ IDEMPOTENCY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Use an RTDB transaction to atomically mark the session as paid.
   // If another webhook/request already set paymentStatus="paid", the transaction
-  // function returns undefined (abort) and committed=false — we stop here.
+  // function returns undefined (abort) and committed=false â€” we stop here.
   const txResult = await sessionRef.transaction((current) => {
     if (!current || current.paymentStatus === "paid") {
       return; // undefined = abort: already paid or node gone
@@ -1576,7 +1632,7 @@ async function legacyProcessSuccessfulPayment(reference, verifiedData, eventName
     };
   });
 
-  // Transaction aborted ⟹ session was already paid; skip to avoid double-credit.
+  // Transaction aborted âŸ¹ session was already paid; skip to avoid double-credit.
   if (!txResult.committed) {
     await auditLog("payment", "already-processed", {
       reference,
@@ -1586,7 +1642,7 @@ async function legacyProcessSuccessfulPayment(reference, verifiedData, eventName
     return;
   }
 
-  // ─── CREATE ORDER (idempotent guard) ─────────────────────────────────────────
+  // â”€â”€â”€ CREATE ORDER (idempotent guard) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const orderSnapshot = await orderRef.once("value");
   if (!orderSnapshot.exists()) {
     const now = getCurrentTimestamp();
@@ -1635,7 +1691,7 @@ async function legacyProcessSuccessfulPayment(reference, verifiedData, eventName
       };
     });
 
-    // ─── WALLET CREDIT (atomic) ──────────────────────────────────────────────
+    // â”€â”€â”€ WALLET CREDIT (atomic) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     await db.ref(`wallet/${session.ownerId}`).transaction((wallet) => {
       const w = wallet || { balance: 0, totalEarned: 0, totalOrders: 0 };
       return {
@@ -1648,7 +1704,7 @@ async function legacyProcessSuccessfulPayment(reference, verifiedData, eventName
       };
     });
 
-    // ─── WALLET LEDGER ENTRY (audit trail) ──────────────────────────────────
+    // â”€â”€â”€ WALLET LEDGER ENTRY (audit trail) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const walletTxRef = db.ref(`walletTransactions/${session.ownerId}`).push();
     await walletTxRef.set({
       type: "credit",
@@ -1664,10 +1720,10 @@ async function legacyProcessSuccessfulPayment(reference, verifiedData, eventName
       createdAt: now,
     });
 
-    console.log(`[Wallet] Owner ${session.ownerId} credited ₵${session.amount} for ref ${reference}`);
+    console.log(`[Wallet] Owner ${session.ownerId} credited â‚µ${session.amount} for ref ${reference}`);
   }
 
-  // ─── FULFILLMENT ─────────────────────────────────────────────────────────────
+  // â”€â”€â”€ FULFILLMENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   await auditLog("payment", "confirmed", {
     reference,
     eventName,
@@ -1734,11 +1790,118 @@ async function legacyProcessSuccessfulPayment(reference, verifiedData, eventName
   }
 }
 
+// â”€â”€ Wallet Deposit Credit Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Called when Paystack confirms a WDEP- reference (wallet top-up payment).
+// Fully idempotent: checks deposit status before crediting.
+async function processWalletDeposit(reference, verifiedData, eventName) {
+  // Find which owner this deposit belongs to via walletDeposits index
+  const amountKobo = Number(verifiedData?.amount || 0);
+  const amountGhs  = amountKobo / 100;
+
+  if (!amountGhs || amountGhs <= 0) {
+    console.warn(`[WalletDeposit] Zero or invalid amount for ref ${reference}`);
+    return;
+  }
+
+  // The reference encodes the owner â€” search across all owners
+  const depositsSnap = await db.ref('walletDeposits')
+    .orderByChild('reference').equalTo(reference)
+    .once('value');
+
+  // Also try direct lookup (reference stored under ownerId)
+  let depositRecord = null;
+  let ownerId = null;
+
+  if (depositsSnap.exists()) {
+    depositsSnap.forEach(ownerNode => {
+      ownerNode.forEach(depNode => {
+        if (depNode.val()?.reference === reference) {
+          depositRecord = { ...depNode.val(), _path: depNode.ref.toString() };
+          ownerId = depNode.val().ownerId;
+        }
+      });
+    });
+  }
+
+  // Try direct reference lookup in walletDeposits index if not found via query
+  // (Firebase doesn't index nested paths easily â€” we stored ownerId in the record)
+  if (!depositRecord && verifiedData?.metadata?.ownerId) {
+    ownerId = sanitizeString(verifiedData.metadata.ownerId, 128);
+    const directSnap = await db.ref(`walletDeposits/${ownerId}/${reference}`).once('value');
+    if (directSnap.exists()) {
+      depositRecord = directSnap.val();
+    }
+  }
+
+  if (!depositRecord || !ownerId) {
+    console.warn(`[WalletDeposit] No deposit record found for ref ${reference}`);
+    return;
+  }
+
+  // Idempotency: skip if already credited
+  if (depositRecord.status === 'credited') {
+    console.log(`[WalletDeposit] Already credited for ref ${reference}, skipping.`);
+    return;
+  }
+
+  const now = getCurrentTimestamp();
+
+  // Atomically mark the deposit as credited (prevents double-credit)
+  const depositRef = db.ref(`walletDeposits/${ownerId}/${reference}`);
+  const txResult = await depositRef.transaction(dep => {
+    if (!dep) return dep; // abort if missing
+    if (dep.status === 'credited') return; // abort â€” already done
+    return { ...dep, status: 'credited', creditedAt: now, updatedAt: now };
+  });
+
+  if (!txResult.committed) {
+    console.log(`[WalletDeposit] Transaction aborted for ref ${reference} â€” likely already credited.`);
+    return;
+  }
+
+  // Credit the wallet atomically
+  await db.ref(`wallet/${ownerId}`).transaction(wallet => {
+    const w = wallet || { balance: 0, totalEarned: 0, totalOrders: 0 };
+    return {
+      ...w,
+      balance:     parseFloat(((w.balance     || 0) + amountGhs).toFixed(2)),
+      totalEarned: parseFloat(((w.totalEarned || 0) + amountGhs).toFixed(2)),
+      currency:    'GHS',
+      lastCreditAt: now,
+      updatedAt:    now,
+    };
+  });
+
+  // Write ledger entry
+  const txRef = db.ref(`walletTransactions/${ownerId}`).push();
+  await txRef.set({
+    type:              'credit',
+    amount:            amountGhs,
+    currency:          'GHS',
+    reference,
+    paystackReference: reference,
+    description:       'Wallet top-up via Paystack',
+    source:            eventName === 'charge.success' ? 'paystack-webhook' : 'manual-verify',
+    createdAt:         now,
+  });
+
+  console.log(`[WalletDeposit] Owner ${ownerId} credited â‚µ${amountGhs} for deposit ref ${reference}`);
+}
+
 async function processSuccessfulPayment(reference, verifiedData, eventName) {
+  // â”€â”€ WALLET DEPOSIT FAST PATH â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // References beginning with WDEP- belong to the wallet top-up flow,
+  // not to storefront orders. Handle them separately and return early.
+  if (String(reference || '').startsWith('WDEP-')) {
+    await processWalletDeposit(reference, verifiedData, eventName);
+    return;
+  }
+
   const sessionRef = db.ref(`paymentSessions/${reference}`);
   const orderRef = db.ref(`orders/${reference}`);
 
-  // ── IDEMPOTENCY FAST PATH ─────────────────────────────────────────────────────
+
+  // â”€â”€ IDEMPOTENCY FAST PATH â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // If the order already exists and is fully paid + fulfilled, skip entirely.
   // This prevents any possible double-processing on duplicate webhook deliveries.
   const [quickSession, quickOrder] = await Promise.all([
@@ -1753,7 +1916,7 @@ async function processSuccessfulPayment(reference, verifiedData, eventName) {
     const fulfillmentDone = ["delivered", "fulfilled"].includes(
       sanitizeString(qo.fulfillmentStatus, 40).toLowerCase()
     );
-    // If already paid AND either fulfilled or no hubnet package needed — skip.
+    // If already paid AND either fulfilled or no hubnet package needed â€” skip.
     if (alreadyPaid && (fulfillmentDone || !hasHubnetPackage(qs))) {
       await auditLog("payment", "already-processed-fast-path", {
         reference,
@@ -1844,12 +2007,12 @@ async function processSuccessfulPayment(reference, verifiedData, eventName) {
     lastVerifiedAt: now,
   });
 
-  console.log("\n✓ [PAYMENT CONFIRMED] Payment verified via Paystack");
-  console.log(`  └─ Reference: ${reference}`);
-  console.log(`  └─ Amount: ₵${(actualAmountKobo / 100).toFixed(2)}`);
-  console.log(`  └─ Customer: ${session.email}`);
-  console.log(`  └─ Fulfillment Provider: ${initialFulfillmentProvider}`);
-  console.log(`  └─ Next Status: ${nextSessionFulfillmentStatus}`);
+  console.log("\nâœ“ [PAYMENT CONFIRMED] Payment verified via Paystack");
+  console.log(`  â””â”€ Reference: ${reference}`);
+  console.log(`  â””â”€ Amount: â‚µ${(actualAmountKobo / 100).toFixed(2)}`);
+  console.log(`  â””â”€ Customer: ${session.email}`);
+  console.log(`  â””â”€ Fulfillment Provider: ${initialFulfillmentProvider}`);
+  console.log(`  â””â”€ Next Status: ${nextSessionFulfillmentStatus}`);
 
   await orderRef.transaction((current) => {
     const existingHistory = Array.isArray(current?.statusHistory) ? current.statusHistory : [];
@@ -1967,18 +2130,18 @@ async function processSuccessfulPayment(reference, verifiedData, eventName) {
   if (shouldAttemptHubnet) {
     // Run Hubnet in a protected try/catch: a Hubnet API error must NEVER
     // roll back the payment confirmation. The payment is already recorded as paid.
-    console.log("\n→ [HUBNET] Initiating data bundle provisioning...");
-    console.log(`  └─ Reference: ${reference}`);
-    console.log(`  └─ Network: ${session.packageNetwork?.toUpperCase()}`);
-    console.log(`  └─ Volume: ${session.packageVolume}MB`);
-    console.log(`  └─ Phone: ****${String(session.beneficiaryPhone || "").slice(-4)}`);
+    console.log("\nâ†’ [HUBNET] Initiating data bundle provisioning...");
+    console.log(`  â””â”€ Reference: ${reference}`);
+    console.log(`  â””â”€ Network: ${session.packageNetwork?.toUpperCase()}`);
+    console.log(`  â””â”€ Volume: ${session.packageVolume}MB`);
+    console.log(`  â””â”€ Phone: ****${String(session.beneficiaryPhone || "").slice(-4)}`);
     try {
       const result = await attemptHubnetFulfillment(reference);
       console.log(`\n[HUBNET ATTEMPT RESULT] ${JSON.stringify(result)}`);
     } catch (hubnetError) {
-      console.error("\n╔════════════════════════════════════════════════════════════════╗");
-      console.error("║ ✗ [HUBNET UNHANDLED ERROR] Exception thrown                   ║");
-      console.error("╚════════════════════════════════════════════════════════════════╝");
+      console.error("\nâ•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+      console.error("â•‘ âœ— [HUBNET UNHANDLED ERROR] Exception thrown                   â•‘");
+      console.error("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
       console.error(`Error message: ${hubnetError?.message}`);
       console.error(`Error stack: ${hubnetError?.stack}`);
       console.error(`Error object: ${JSON.stringify(hubnetError, null, 2)}`);
@@ -2080,7 +2243,7 @@ app.disable("x-powered-by");
 // rate-limit IP detection and secure cookie behaviour)
 app.set("trust proxy", 1);
 
-// ── Security Headers ─────────────────────────────────────────────────────────
+// â”€â”€ Security Headers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -2111,7 +2274,7 @@ const corsMiddleware = cors({
 app.use(corsMiddleware);
 app.options("*", corsMiddleware);
 
-// Body parsing — the verify callback captures the raw body BEFORE JSON parsing.
+// Body parsing â€” the verify callback captures the raw body BEFORE JSON parsing.
 // This is the ONLY correct way to get the raw body for Paystack webhook signature
 // verification. A separate middleware after express.json() would see an exhausted
 // stream and always produce an empty buffer, breaking signature checks.
@@ -2133,8 +2296,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Rate Limiting ─────────────────────────────────────────────────────────────
-// Strict limit on payment initialization — prevents brute-force attempts
+// â”€â”€ Rate Limiting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Strict limit on payment initialization â€” prevents brute-force attempts
 const paymentInitRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 20,                   // max 20 payment inits per IP per window
@@ -2306,7 +2469,7 @@ app.get("/api/public/orders/track/:reference", publicApiRateLimit, asyncHandler(
   });
 }));
 
-// Public: Order lookup — supports ?reference=XYZ OR ?phone=0271234567
+// Public: Order lookup â€” supports ?reference=XYZ OR ?phone=0271234567
 // Per DevNox spec: https://your-api.com/v1/orders?reference=XYZ12345
 //                 https://your-api.com/v1/orders?phone=0247000195
 app.get("/v1/orders", asyncHandler(async (req, res) => {
@@ -2329,7 +2492,7 @@ app.get("/v1/orders", asyncHandler(async (req, res) => {
   let orderId = null;
   let order = null;
 
-  // ── Lookup by reference ───────────────────────────────────────────────────────
+  // â”€â”€ Lookup by reference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (reference) {
     // Try direct order key first (fastest)
     const direct = await db.ref(`orders/${reference}`).once("value");
@@ -2352,7 +2515,7 @@ app.get("/v1/orders", asyncHandler(async (req, res) => {
     }
   }
 
-  // ── Lookup by phone (if reference not found or not provided) ──────────────────
+  // â”€â”€ Lookup by phone (if reference not found or not provided) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (!order && phone) {
     const byPhone = await db.ref("orders")
       .orderByChild("beneficiaryPhone")
@@ -2372,10 +2535,10 @@ app.get("/v1/orders", asyncHandler(async (req, res) => {
   const paymentStatus = sanitizeString(order.paymentStatus, 40).toLowerCase() || "pending";
 
   // Derive a human-meaningful overall status:
-  // - If bundle delivered → "delivered"
-  // - If bundle processing → "processing"
-  // - If paid but bundle pending → "paid" (bundle pending)
-  // - Otherwise → fall back to payment status
+  // - If bundle delivered â†’ "delivered"
+  // - If bundle processing â†’ "processing"
+  // - If paid but bundle pending â†’ "paid" (bundle pending)
+  // - Otherwise â†’ fall back to payment status
   let status = sanitizeString(order.status, 40).toLowerCase();
   if (!status) {
     if (fulfillmentStatus === "delivered" || fulfillmentStatus === "fulfilled") {
@@ -2478,13 +2641,13 @@ app.post("/api/public/payments/initialize", paymentInitRateLimit, asyncHandler(a
 
   await sessionRef.set(sessionPayload);
   
-  console.log("\n✓ [PAYMENT INIT] Order created for customer");
-  console.log(`  └─ Reference: ${reference}`);
-  console.log(`  └─ Store: ${slug} (ID: ${storeId})`);
-  console.log(`  └─ Package: ${selectedPackage.name}${selectedPackage.volume != null ? ` - ${selectedPackage.volume}MB` : ""}${selectedPackage.network ? ` on ${String(selectedPackage.network).toUpperCase()}` : ""}`);
-  console.log(`  └─ Amount: ₵${selectedPackage.sellingPrice.toFixed(2)}`);
-  console.log(`  └─ Customer: ${email} | Phone: ****${beneficiaryPhone.slice(-4)}`);
-  console.log(`  └─ Fulfillment: ${sessionPayload.fulfillmentProvider || "manual"}`);
+  console.log("\nâœ“ [PAYMENT INIT] Order created for customer");
+  console.log(`  â””â”€ Reference: ${reference}`);
+  console.log(`  â””â”€ Store: ${slug} (ID: ${storeId})`);
+  console.log(`  â””â”€ Package: ${selectedPackage.name}${selectedPackage.volume != null ? ` - ${selectedPackage.volume}MB` : ""}${selectedPackage.network ? ` on ${String(selectedPackage.network).toUpperCase()}` : ""}`);
+  console.log(`  â””â”€ Amount: â‚µ${selectedPackage.sellingPrice.toFixed(2)}`);
+  console.log(`  â””â”€ Customer: ${email} | Phone: ****${beneficiaryPhone.slice(-4)}`);
+  console.log(`  â””â”€ Fulfillment: ${sessionPayload.fulfillmentProvider || "manual"}`);
   
   await auditLog("payment", "initialize-requested", {
     requestId: req.requestId,
@@ -2500,7 +2663,7 @@ app.post("/api/public/payments/initialize", paymentInitRateLimit, asyncHandler(a
   });
 
   try {
-    console.log(`→ [PAYSTACK] Initializing transaction for reference: ${reference}`);
+    console.log(`â†’ [PAYSTACK] Initializing transaction for reference: ${reference}`);
     const paystackResponse = await paystack.initializeTransaction({
       email,
       amount: selectedPackage.sellingPrice,
@@ -2522,9 +2685,9 @@ app.post("/api/public/payments/initialize", paymentInitRateLimit, asyncHandler(a
       throw new Error("Paystack did not return an authorization URL.");
     }
 
-    console.log("✓ [PAYSTACK] Transaction initialized successfully");
-    console.log(`  └─ Authorization URL: ${authorizationUrl}`);
-    console.log(`  └─ Access Code: ${paystackResponse?.data?.access_code}`);
+    console.log("âœ“ [PAYSTACK] Transaction initialized successfully");
+    console.log(`  â””â”€ Authorization URL: ${authorizationUrl}`);
+    console.log(`  â””â”€ Access Code: ${paystackResponse?.data?.access_code}`);
 
     await sessionRef.update({
       paymentProvider: "paystack",
@@ -2631,7 +2794,7 @@ app.post(["/api/public/payments/webhook", "/paystack/webhook"], webhookRateLimit
         reference,
         error: sanitizeString(recoveryError?.message, 200),
       }, "warn");
-      // Still proceed — processSuccessfulPayment will attempt its own recovery.
+      // Still proceed â€” processSuccessfulPayment will attempt its own recovery.
     }
   }
 
@@ -2686,14 +2849,14 @@ app.post(["/api/public/hubnet/webhook", "/hubnet/webhook"], webhookRateLimit, as
       hubnetReference,
       eventId,
     }, "warn");
-    console.log(`⚠ [HUBNET WEBHOOK] Duplicate event (already processed): ${eventName} | Ref: ${hubnetReference}`);
+    console.log(`âš  [HUBNET WEBHOOK] Duplicate event (already processed): ${eventName} | Ref: ${hubnetReference}`);
     sendJson(res, 200, { received: true, duplicate: true });
     return;
   }
 
-  console.log(`\n✓ [HUBNET WEBHOOK] Event received: ${eventName}`);
-  console.log(`  └─ Reference: ${hubnetReference}`);
-  console.log(`  └─ Event ID: ${eventId}`);
+  console.log(`\nâœ“ [HUBNET WEBHOOK] Event received: ${eventName}`);
+  console.log(`  â””â”€ Reference: ${hubnetReference}`);
+  console.log(`  â””â”€ Event ID: ${eventId}`);
 
   if (!hubnetReference) {
     await auditLog("hubnet", "webhook-received", {
@@ -2945,6 +3108,12 @@ app.post("/api/public/payments/verify/:reference", asyncHandler(async (req, res)
 
 // Owner: Get user profile
 app.get("/api/owner/me", verifyAuth, asyncHandler(async (req, res) => {
+  const bootstrap = await ensureOwnerBootstrap(req.user);
+  sendJson(res, 200, bootstrap.user);
+}));
+
+// Generic user endpoint (alias for /api/owner/me)
+app.get("/api/user/me", verifyAuth, asyncHandler(async (req, res) => {
   const bootstrap = await ensureOwnerBootstrap(req.user);
   sendJson(res, 200, bootstrap.user);
 }));
@@ -3250,12 +3419,232 @@ app.get("/api/owner/wallet/transactions", verifyAuth, asyncHandler(async (req, r
   sendJson(res, 200, { transactions, total: transactions.length });
 }));
 
-// ============================================================================
-// FRONTEND - Serve static files and SPA routing
+// Owner: Initialize a wallet deposit via Paystack
+app.post('/api/owner/wallet/deposit/initialize', verifyAuth, asyncHandler(async (req, res) => {
+  if (!paystack) {
+    throw httpError(503, 'Payment provider is not configured.');
+  }
+
+  const amount = toPrice(req.body.amount);
+  if (!amount || amount < 1) {
+    throw httpError(400, 'Amount must be at least â‚µ1.00');
+  }
+  if (amount > 10000) {
+    throw httpError(400, 'Amount cannot exceed â‚µ10,000 per deposit');
+  }
+
+  const email = normalizeEmail(req.body.email || req.user.email || '');
+  if (!isLikelyEmail(email)) {
+    throw httpError(400, 'A valid email address is required for payment.');
+  }
+
+  const ownerId = sanitizeString(req.user.uid, 128);
+  const reference = `WDEP-${ownerId.slice(0, 8).toUpperCase()}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+  const callbackUrl = `${APP_BASE_URL}/app/balance?deposit_ref=${encodeURIComponent(reference)}&deposit=success`;
+  const amountKobo = Math.round(amount * 100); // Paystack uses pesewas (subunit)
+
+  // Persist pending deposit record so webhook can credit the wallet
+  const now = getCurrentTimestamp();
+  await db.ref(`walletDeposits/${ownerId}/${reference}`).set({
+    reference,
+    ownerId,
+    amount,
+    email,
+    status: 'initialized',
+    type: 'deposit',
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  let paystackResult;
+  try {
+    paystackResult = await paystack.initializeTransaction({
+      email,
+      amount: amountKobo,
+      reference,
+      currency: 'GHS',
+      callback_url: callbackUrl,
+      metadata: {
+        custom_fields: [{ display_name: 'Purpose', variable_name: 'purpose', value: 'Wallet Deposit' }],
+        ownerId,
+        depositType: 'wallet',
+        reference,
+      },
+    });
+  } catch (err) {
+    await db.ref(`walletDeposits/${ownerId}/${reference}/status`).set('failed');
+    throw httpError(502, 'Unable to initialize the payment provider.');
+  }
+
+  if (!paystackResult?.data?.authorization_url) {
+    await db.ref(`walletDeposits/${ownerId}/${reference}/status`).set('failed');
+    throw httpError(502, 'Invalid response from payment provider.');
+  }
+
+  sendJson(res, 200, {
+    authorization_url: paystackResult.data.authorization_url,
+    reference,
+  });
+}));
+
+// Deposit endpoint alias for client compatibility
+app.post('/api/wallet/deposit/initialize', verifyAuth, asyncHandler(async (req, res) => {
+  // Forward to /api/owner/wallet/deposit/initialize
+  // Simply call the handler directly
+  if (!paystack) {
+    throw httpError(503, 'Payment provider is not configured.');
+  }
+
+  const amount = toPrice(req.body.amount);
+  if (!amount || amount < 1) {
+    throw httpError(400, 'Amount must be at least â‚µ1.00');
+  }
+  if (amount > 10000) {
+    throw httpError(400, 'Amount cannot exceed â‚µ10,000 per deposit');
+  }
+
+  const email = normalizeEmail(req.body.email || req.user.email || '');
+  if (!isLikelyEmail(email)) {
+    throw httpError(400, 'A valid email address is required for payment.');
+  }
+
+  const ownerId = sanitizeString(req.user.uid, 128);
+  const reference = `WDEP-${ownerId.slice(0, 8).toUpperCase()}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+  const callbackUrl = `${APP_BASE_URL}/app/balance?deposit_ref=${encodeURIComponent(reference)}&deposit=success`;
+  const amountKobo = Math.round(amount * 100);
+
+  const now = getCurrentTimestamp();
+  await db.ref(`walletDeposits/${ownerId}/${reference}`).set({
+    reference,
+    ownerId,
+    amount,
+    email,
+    status: 'initialized',
+    type: 'deposit',
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  let paystackResult;
+  try {
+    paystackResult = await paystack.initializeTransaction({
+      email,
+      amount: amountKobo,
+      reference,
+      currency: 'GHS',
+      callback_url: callbackUrl,
+      metadata: {
+        custom_fields: [{ display_name: 'Purpose', variable_name: 'purpose', value: 'Wallet Deposit' }],
+        ownerId,
+        depositType: 'wallet',
+        reference,
+      },
+    });
+  } catch (err) {
+    await db.ref(`walletDeposits/${ownerId}/${reference}/status`).set('failed');
+    throw httpError(502, 'Unable to initialize the payment provider.');
+  }
+
+  if (!paystackResult?.data?.authorization_url) {
+    await db.ref(`walletDeposits/${ownerId}/${reference}/status`).set('failed');
+    throw httpError(502, 'Invalid response from payment provider.');
+  }
+
+  sendJson(res, 200, {
+    authorization_url: paystackResult.data.authorization_url,
+    reference,
+  });
+}));
+
+// Owner: Verify a wallet deposit after Paystack redirects back to the app.
+// This provides a secure, authenticated recovery path if the webhook arrives late.
+app.post('/api/owner/wallet/deposits/:reference/verify', verifyAuth, asyncHandler(async (req, res) => {
+  if (!paystack) {
+    throw httpError(503, 'Payment provider is not configured.');
+  }
+
+  const ownerId = sanitizeString(req.user.uid, 128);
+  const reference = sanitizeString(req.params.reference, 120);
+  if (!reference || !reference.startsWith('WDEP-')) {
+    throw httpError(400, 'Invalid deposit reference.');
+  }
+
+  const depositRef = db.ref(`walletDeposits/${ownerId}/${reference}`);
+  const depositSnapshot = await depositRef.once('value');
+  if (!depositSnapshot.exists()) {
+    throw httpError(404, 'Deposit record not found.');
+  }
+
+  let deposit = depositSnapshot.val() || {};
+  let paystackStatus = sanitizeString(deposit.paystackStatus, 40).toLowerCase() || null;
+
+  if (deposit.status !== 'credited') {
+    let verification;
+    try {
+      verification = await paystack.verifyTransaction(reference);
+    } catch (_error) {
+      throw httpError(502, 'Unable to verify the deposit with Paystack right now.');
+    }
+
+    paystackStatus = sanitizeString(verification?.data?.status, 40).toLowerCase() || null;
+    await depositRef.update({
+      paystackStatus,
+      lastVerifiedAt: getCurrentTimestamp(),
+      updatedAt: getCurrentTimestamp(),
+    });
+
+    if (paystackStatus === 'success') {
+      await processWalletDeposit(reference, verification.data, 'manual-verify');
+    } else if (['failed', 'abandoned', 'reversed'].includes(paystackStatus)) {
+      await depositRef.update({
+        status: 'failed',
+        failedAt: getCurrentTimestamp(),
+        updatedAt: getCurrentTimestamp(),
+      });
+    }
+  }
+
+  const [freshDepositSnapshot, walletSnapshot] = await Promise.all([
+    depositRef.once('value'),
+    db.ref(`wallet/${ownerId}`).once('value'),
+  ]);
+
+  deposit = freshDepositSnapshot.val() || deposit;
+  const wallet = walletSnapshot.val() || {
+    balance: 0,
+    totalEarned: 0,
+    totalOrders: 0,
+    currency: 'GHS',
+    lastCreditAt: null,
+  };
+
+  sendJson(res, 200, {
+    reference,
+    status: sanitizeString(deposit.status, 40) || 'initialized',
+    paystackStatus: paystackStatus || sanitizeString(deposit.paystackStatus, 40) || 'pending',
+    amount: Number(deposit.amount) || 0,
+    creditedAt: deposit.creditedAt || null,
+    wallet: {
+      balance: Number(wallet.balance) || 0,
+      totalEarned: Number(wallet.totalEarned) || 0,
+      totalOrders: Number(wallet.totalOrders) || 0,
+      currency: wallet.currency || 'GHS',
+      lastCreditAt: wallet.lastCreditAt || null,
+    },
+  });
+}));
+
+// Paystack webhook: credit wallet on successful deposit
+// NOTE: This is handled by the existing /paystack/webhook endpoint which already
+// processes charge.success. We detect wallet deposits by the reference prefix 'WDEP-'
+// and credit the wallet accordingly via the walletDeposits record.
 // ============================================================================
 
 // Serve static files from public folder
 app.use(express.static(PUBLIC_DIR));
+
+// Silence favicon.ico 404 noise â€” respond with no-content
+app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 // SPA routing: serve appropriate HTML for different routes
 const routes = {
@@ -3264,9 +3653,11 @@ const routes = {
   "/auth/reset": "auth/reset.html",
   "/auth/action": "auth/action.html",
   "/app": "app/dashboard.html",
+  "/app/balance": "app/balance.html",
   "/app/profile": "app/profile.html",
   "/app/configuration": "app/configuration.html",
   "/app/orders": "app/orders.html",
+  "/app/wallet": "app/balance.html",
   "/paystack/callback": "paystack/callback.html",
 };
 
@@ -3286,7 +3677,7 @@ app.get("/s/:slug", (req, res) => {
 // We exclude known subdirectories and reserved words.
 app.get("/:slug", (req, res, next) => {
   const { slug } = req.params;
-  const reserved = ["api", "auth", "app", "css", "js", "img", "paystack", "s"];
+  const reserved = ["api", "auth", "app", "css", "js", "img", "paystack", "s", "store"];
 
   if (reserved.includes(slug)) {
     return next();
@@ -3320,67 +3711,76 @@ app.use((error, req, res, next) => {
 // START SERVER
 // ============================================================================
 
-// Listen on 0.0.0.0 so Render (and other cloud hosts) can route traffic in.
-// 127.0.0.1 would silently accept connections only from localhost.
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`
-╭─────────────────────────────────────────────────────────────╮
-│   ASK MEDIA - Ghana Unified Backend & Frontend Server     │
-╰─────────────────────────────────────────────────────────────╯
+let server = null;
 
-✓ Server running:           http://localhost:${PORT}
-✓ Frontend:                 http://localhost:${PORT}
-✓ API base:                 http://localhost:${PORT}/api
-✓ Database:                 Firebase Realtime Database
-✓ Auth:                     Firebase Auth
-✓ Currency:                 GHS (Ghana Cedis - ₵)
-✓ Locale:                   Ghana (en-GH)
-✓ Service Account:          ${hasPaystackSecretKey ? "✓ Configured" : "⚠ Not configured"}
-✓ Paystack:                 ${paystack ? "✓ Configured" : "⚠ Not configured"}
-✓ Fulfillment:              ${fulfillment ? "✓ Configured" : "⚠ Not configured"}
+if (require.main === module) {
+  // Listen on 0.0.0.0 so Render (and other cloud hosts) can route traffic in.
+  // 127.0.0.1 would silently accept connections only from localhost.
+  server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`
+â•­â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â•®
+â”‚   ASK MEDIA - Ghana Unified Backend & Frontend Server     â”‚
+â•°â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â•¯
 
-📱 Try these URLs:
-   • http://localhost:${PORT}/
-   • http://localhost:${PORT}/auth/login
-   • http://localhost:${PORT}/auth/signup
-   • http://localhost:${PORT}/app
-   • http://localhost:${PORT}/api/health
+âœ“ Server running:           http://localhost:${PORT}
+âœ“ Frontend:                 http://localhost:${PORT}
+âœ“ API base:                 http://localhost:${PORT}/api
+âœ“ Database:                 Firebase Realtime Database
+âœ“ Auth:                     Firebase Auth
+âœ“ Currency:                 GHS (Ghana Cedis - â‚µ)
+âœ“ Locale:                   Ghana (en-GH)
+âœ“ Service Account:          ${hasPaystackSecretKey ? "âœ“ Configured" : "âš  Not configured"}
+âœ“ Paystack:                 ${paystack ? "âœ“ Configured" : "âš  Not configured"}
+âœ“ Fulfillment:              ${fulfillment ? "âœ“ Configured" : "âš  Not configured"}
 
-🔗 API Endpoints:
-   • GET    /api/health
-   • GET    /api/public/store/:slug
-   • POST   /api/public/payments/initialize
-   • GET    /api/public/payments/:reference
-   • POST   /api/public/payments/verify/:reference  ← webhook recovery
-   • GET    /api/public/orders/track/:reference
-   • GET    /api/owner/me
-   • PUT    /api/owner/me
-   • GET    /api/owner/store
-   • PUT    /api/owner/store
-   • POST   /api/owner/store/publish
-   • GET    /api/owner/orders
-   • GET    /api/owner/pipeline-activity            ← payment + bundle audit trail
-   • GET    /api/owner/orders/:orderId
-   • GET    /api/owner/wallet                       ← wallet balance
-   • GET    /api/owner/wallet/transactions          ← wallet ledger
+ðŸ“± Try these URLs:
+   â€¢ http://localhost:${PORT}/
+   â€¢ http://localhost:${PORT}/auth/login
+   â€¢ http://localhost:${PORT}/auth/signup
+   â€¢ http://localhost:${PORT}/app
+   â€¢ http://localhost:${PORT}/api/health
 
-🇬🇭 Ghana Configuration Active:
-   • Currency: GHS | Amounts formatted as 1,234.56 ₵
-   • Dates: DD MMM YYYY (e.g., 15 Apr 2026)
-   • Language: English (Ghana)
+ðŸ”— API Endpoints:
+   â€¢ GET    /api/health
+   â€¢ GET    /api/public/store/:slug
+   â€¢ POST   /api/public/payments/initialize
+   â€¢ GET    /api/public/payments/:reference
+   â€¢ POST   /api/public/payments/verify/:reference  â† webhook recovery
+   â€¢ GET    /api/public/orders/track/:reference
+   â€¢ GET    /api/owner/me
+   â€¢ PUT    /api/owner/me
+   â€¢ GET    /api/owner/store
+   â€¢ PUT    /api/owner/store
+   â€¢ POST   /api/owner/store/publish
+   â€¢ GET    /api/owner/orders
+   â€¢ GET    /api/owner/pipeline-activity            â† payment + bundle audit trail
+   â€¢ GET    /api/owner/orders/:orderId
+   â€¢ GET    /api/owner/wallet                       â† wallet balance
+   â€¢ GET    /api/owner/wallet/transactions          â† wallet ledger
 
-⚠ Note: Restart server to reload code changes
+ðŸ‡¬ðŸ‡­ Ghana Configuration Active:
+   â€¢ Currency: GHS | Amounts formatted as 1,234.56 â‚µ
+   â€¢ Dates: DD MMM YYYY (e.g., 15 Apr 2026)
+   â€¢ Language: English (Ghana)
 
-✓ 100% Ready for Ghana! 🇬🇭
+âš  Note: Restart server to reload code changes
+
+âœ“ 100% Ready for Ghana! ðŸ‡¬ðŸ‡­
 
 `);
-});
+  });
+}
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
-  console.log("\n⏹  Shutting down...");
+  if (!server) {
+    process.exit(0);
+    return;
+  }
+
+  console.log("\nâ¹  Shutting down...");
   server.close(() => {
-    console.log("✓ Server stopped");
+    console.log("âœ“ Server stopped");
     process.exit(0);
   });
 });
