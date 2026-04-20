@@ -2,16 +2,19 @@
   "name": "ask-media-storefront",
   "version": "1.0.0",
   "description": "Standalone Firebase Storefront Platform",
-  "main": "server.js",
+  "main": "functions/src/server.js",
   "engines": {
     "node": "^18.0.0 || ^20.0.0"
   },
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
-    "deploy": "firebase deploy --only hosting,database",
+    "start": "node functions/src/server.js",
+    "dev": "node functions/src/server.js",
+    "firebase:doctor": "node scripts/firebase-credential-doctor.js",
+    "deploy": "firebase deploy --only hosting,functions,database",
     "deploy:full": "firebase deploy --only hosting,functions,database",
+    "deploy:function:app": "firebase deploy --only functions:app",
     "deploy:hosting": "firebase deploy --only hosting",
+    "deploy:hosting:askmedia": "firebase deploy --only hosting:askmedia",
     "deploy:rules": "firebase deploy --only database:rules"
   },
   "keywords": [
