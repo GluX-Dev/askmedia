@@ -567,8 +567,118 @@ function getCurrentTimestamp() {
   return new Date().toISOString();
 }
 
+const OUTBOUND_FIELD_ALIASES = Object.freeze({
+  hubnetReference: "fulfillmentReference",
+  hubnetTransactionId: "fulfillmentTransactionId",
+  hubnetPaymentId: "fulfillmentPaymentId",
+  hubnetMessage: "fulfillmentMessage",
+  hubnetCode: "fulfillmentCode",
+  hubnetReason: "fulfillmentReason",
+  hubnetIpAddress: "fulfillmentIpAddress",
+  hubnetResponseStatus: "fulfillmentResponseStatus",
+  hubnetLastEvent: "fulfillmentLastEvent",
+  hubnetLastWebhookAt: "fulfillmentLastWebhookAt",
+  hubnetInitAt: "fulfillmentInitAt",
+  hubnetLastFailedAt: "fulfillmentLastFailedAt",
+});
+
+function sanitizeProviderText(value) {
+  const input = String(value ?? "");
+  if (!input) {
+    return "";
+  }
+
+  return input
+    .replace(/https?:\/\/[^\s]*hubnet[^\s]*/gi, "the delivery provider endpoint")
+    .replace(/\/hubnet\/webhook/gi, "/fulfillment/webhook")
+    .replace(/\bhubnet_not_configured\b/gi, "delivery_not_configured")
+    .replace(/\bhubnet_inflight\b/gi, "delivery_in_progress")
+    .replace(/\bhubnet_failed\b/gi, "delivery_failed")
+    .replace(/\bhubnet_(live|init|error|webhook)\b/gi, "delivery_$1")
+    .replace(/\bhubnet\b/gi, "fulfillment provider")
+    .replace(/\bHubnet\b/g, "Fulfillment provider");
+}
+
+function sanitizeOutboundPayload(payload, seen = new WeakSet()) {
+  if (payload === null || payload === undefined) {
+    return payload;
+  }
+
+  if (typeof payload === "string") {
+    return sanitizeProviderText(payload);
+  }
+
+  if (typeof payload !== "object") {
+    return payload;
+  }
+
+  if (payload instanceof Date) {
+    return payload.toISOString();
+  }
+
+  if (seen.has(payload)) {
+    return null;
+  }
+
+  seen.add(payload);
+
+  if (Array.isArray(payload)) {
+    const next = payload.map((entry) => sanitizeOutboundPayload(entry, seen));
+    seen.delete(payload);
+    return next;
+  }
+
+  const next = {};
+  for (const [rawKey, rawValue] of Object.entries(payload)) {
+    const key = OUTBOUND_FIELD_ALIASES[rawKey] || rawKey;
+    const value = sanitizeOutboundPayload(rawValue, seen);
+
+    if (!Object.prototype.hasOwnProperty.call(next, key)) {
+      next[key] = value;
+      continue;
+    }
+
+    if (
+      (next[key] === null || next[key] === "" || next[key] === undefined)
+      && value !== null
+      && value !== undefined
+      && value !== ""
+    ) {
+      next[key] = value;
+    }
+  }
+
+  seen.delete(payload);
+  return next;
+}
+
+function describeRetryResult(result) {
+  const reason = sanitizeString(result?.reason, 160).toLowerCase();
+  const hasTransactionId = Boolean(sanitizeString(result?.hubnetTransactionId, 120));
+
+  if (!result?.attempted) {
+    if (reason === "delivery_in_progress") {
+      return "Skipped: delivery is already in progress.";
+    }
+    if (reason === "delivery_not_configured") {
+      return "Skipped: bundle delivery is not configured.";
+    }
+    return "Skipped: retry conditions were not met.";
+  }
+
+  if (hasTransactionId) {
+    return "Bundle delivery initiated.";
+  }
+
+  if (reason === "delivery_failed") {
+    return "Retry submitted, but delivery is still pending.";
+  }
+
+  return "Retry submitted. Delivery status updated.";
+}
+
 function sendJson(res, statusCode, payload) {
-  res.status(statusCode).json(payload);
+  res.status(statusCode).json(sanitizeOutboundPayload(payload));
 }
 
 function maskEmail(email) {
@@ -2083,7 +2193,7 @@ async function attemptHubnetFulfillment(orderId) {
   
   if (!hubnet) {
     console.error(`[Hubnet] Skipping fulfillment: helper not configured.`);
-    return { attempted: false, reason: "hubnet_not_configured" };
+    return { attempted: false, reason: "delivery_not_configured" };
   }
   debugLog(`  Ã¢Å“â€œ Hubnet helper loaded`);
 
@@ -2207,7 +2317,7 @@ async function attemptHubnetFulfillment(orderId) {
     }
     if (inflight && fs === "processing") {
       console.warn("[Hubnet] Lock skipped, provisioning already in progress.");
-      return { attempted: false, reason: "hubnet_inflight" };
+      return { attempted: false, reason: "delivery_in_progress" };
     }
     console.error(`[Hubnet] Lock not acquired for ${orderId}. fulfillment=${fs}`);
     return { attempted: false, reason: "locked" };
@@ -2308,7 +2418,7 @@ async function attemptHubnetFulfillment(orderId) {
     debugLog(`  Ã¢â€ â€™ Response details: accepted="${details.accepted}" transactionId="${details.transactionId}" status="${details.status}"`);
     
     if (!details.accepted) {
-      const reason = details.message || details.reason || "Hubnet did not confirm the bundle request.";
+      const reason = details.message || details.reason || "Delivery provider did not confirm the bundle request.";
       console.error(`[Hubnet] API response not accepted: ${reason}`);
       throw new Error(reason);
     }
@@ -2381,7 +2491,7 @@ async function attemptHubnetFulfillment(orderId) {
 
     return { attempted: true, hubnetReference, hubnetTransactionId };
   } catch (error) {
-    const message = sanitizeString(error?.message || error?.payload?.message, 500) || "Hubnet transaction failed.";
+    const message = sanitizeString(error?.message || error?.payload?.message, 500) || "Bundle delivery request failed.";
     const now2 = getCurrentTimestamp();
     
     debugLog("[Hubnet] verbose error banner omitted.");
@@ -2439,7 +2549,7 @@ async function attemptHubnetFulfillment(orderId) {
     }, "error");
     debugLog(`  Ã¢Å“â€œ Audit log recorded`);
 
-    return { attempted: true, reason: "hubnet_failed", error: message };
+    return { attempted: true, reason: "delivery_failed", error: message };
   }
 }
 
@@ -3746,7 +3856,7 @@ app.get("/v1/orders", publicApiRateLimit, asyncHandler(async (req, res) => {
     try {
       liveOrder = await fetchHubnetLiveOrderByReference(reference);
     } catch (_error) {
-      throw httpError(502, "Unable to query Hubnet live order status right now.");
+      throw httpError(502, "Unable to query live bundle delivery status right now.");
     }
     if (liveOrder) {
       sendJson(res, 200, liveOrder);
@@ -4049,7 +4159,7 @@ app.post([DELIVERY_WEBHOOK_PATH, LEGACY_DELIVERY_WEBHOOK_PATH, "/hubnet/webhook"
         requestId: req.requestId,
         path: req.originalUrl,
       }, "warn");
-      throw httpError(401, "Invalid Hubnet webhook secret.");
+      throw httpError(401, "Invalid fulfillment webhook secret.");
     }
   }
 
@@ -4746,7 +4856,7 @@ app.get('/api/owner/orders/:orderId', verifyAuth, asyncHandler(async (req, res) 
   sendJson(res, 200, { id: orderId, ...snapshot.val() });
 }));
 
-// Owner: Retry Hubnet fulfillment for a failed/stuck order
+// Owner: Retry bundle fulfillment for a failed/stuck order
 app.post('/api/owner/orders/:orderId/retry-fulfillment', verifyAuth, asyncHandler(async (req, res) => {
   if (!hubnet) throw httpError(503, 'Bundle delivery is not configured.');
   await ensureOwnerBootstrap(req.user);
@@ -4776,10 +4886,8 @@ app.post('/api/owner/orders/:orderId/retry-fulfillment', verifyAuth, asyncHandle
   sendJson(res, 200, {
     orderId, retryResult: result,
     fulfillmentStatus: freshOrder.fulfillmentStatus || 'processing',
-    hubnetTransactionId: freshOrder.hubnetTransactionId || null,
-    message: result.attempted
-      ? (result.hubnetTransactionId ? 'Bundle delivery initiated.' : 'Retry: ' + (result.reason || result.error || 'unknown'))
-      : 'Skipped: ' + (result.reason || 'unknown'),
+    fulfillmentTransactionId: freshOrder.hubnetTransactionId || null,
+    message: describeRetryResult(result),
   });
 }));
 
@@ -5487,10 +5595,8 @@ app.post("/api/admin/orders/:orderId/retry-fulfillment", verifyAuth, requireAdmi
     orderId,
     retryResult: result,
     fulfillmentStatus: freshOrder.fulfillmentStatus || "processing",
-    hubnetTransactionId: freshOrder.hubnetTransactionId || null,
-    message: result.attempted
-      ? (result.hubnetTransactionId ? "Bundle delivery initiated." : `Retry: ${result.reason || result.error || "unknown"}`)
-      : `Skipped: ${result.reason || "unknown"}`,
+    fulfillmentTransactionId: freshOrder.hubnetTransactionId || null,
+    message: describeRetryResult(result),
   });
 }));
 
